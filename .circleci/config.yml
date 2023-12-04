@@ -1,0 +1,199 @@
+version: 2.1
+
+executors:
+  go-exec:
+    docker:
+      - image: cimg/go:1.21.4
+
+# Each job specifies a number of steps which are executed in a docker container.
+jobs:
+
+  # Pull the src code from the repository and add it to the workspace.
+  # Any job that uses the src code must require this job to finish beforehand.
+  pull:
+    executor: go-exec
+    steps:
+      # A special step used to checkout the source code.
+      - checkout
+      # A special step used to persist a file/folder to be used by another job
+      # in the workflow.
+      - persist_to_workspace:
+          root: .
+          paths: .
+
+  # Make sure that `go fmt` `go mod tidy` and `go mod vendor` were run.
+  gofmt:
+    executor: go-exec
+    steps:
+      # A special step used to attach the workflow's workspace to the current
+      # executor. The full contents of the workspace are downloaded and copied
+      # into the directory the workspace is being attached at.
+      - attach_workspace:
+          at: .
+      # Run `go fmt`, `go mod tidy`, and `go mod vendor`. Note that they need to
+      # be run from within the project folder. Then check the diff and fail the
+      # step if there is any. Note that `git diff` only prints the diff and does
+      # not error. Running `git diff --quiet` will error in case of diff.
+      - run: go fmt ./...
+      - run: go mod tidy
+      - run: go mod vendor
+      - run:
+          command: |
+            git --no-pager diff
+            git --no-pager diff --quiet
+
+  # Run the linters.
+  lint:
+    executor: go-exec
+    steps:
+      # Attach the workspace to the current executor.
+      - attach_workspace:
+          at: .
+      # Install golangci-lint, see: https://golangci-lint.run/usage/install/.
+      - run:
+          environment:
+            GOLANGCI_LINT_VERSION: v1.55.2
+          command: |
+            wget -O- -nv https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s ${GOLANGCI_LINT_VERSION}
+      # Run the golang linters using golangci-lint. The linters that will be run
+      # are defined inside the .golangci.yml file.
+      - run: golangci-lint run -v ./...
+
+  # Run the unit tests.
+  unit_tests:
+    executor: go-exec
+    steps:
+      # Attach the workspace to the current executor.
+      - attach_workspace:
+          at: .
+      # TODO: unit tests should be run with the flag -short in order to
+      # differentiate them from the integration tests.
+      # go test -short -shuffle=on -race -coverprofile /app/coverage.out /app/...
+      # The unit tests reside inside the src folder.
+      - run: go test ./src/...
+
+  # Run the integration tests.
+  integration_tests:
+    executor: go-exec
+    steps:
+      # Attach the workspace to the current executor.
+      - attach_workspace:
+          at: .
+      # Allows docker commands to be run locally. This is required to get access
+      # to docker from within the executor.
+      - setup_remote_docker
+      # The integration tests might require running additional services.
+      # All of these are defined in the docker-compose file.
+      - run: docker-compose up -d --build
+
+      # Note that we are running a docker container inside a docker container.
+      # The `integration_tests` is run from inside `go-exec`. A well known
+      # shortcoming is that you can't mount a volume from one docker container
+      # to another. As a workaround we will copy the contents of the repository
+      # into the integration_tests container and run `docker-compose exec`.
+      - run: docker cp ./ integration_tests:/usr/service/
+      - run: docker-compose exec -T integration_tests go test ./src/...
+
+      # Stopping and removing containers, volumes, and networks makes sure tests
+      # are not broken due to data that has persisted from the last test run.
+      - run: docker-compose down --volumes --remove-orphans
+
+  # TODO: Add e2e tests.
+  # Run e2e tests.
+  e2e_tests:
+    executor: go-exec
+    steps:
+      - run: echo "e2e tests should be run"
+
+  # Build a docker image with the service binary and push it to DockerHub.
+  # The image will be tagged with the git branch tag. This job should be run
+  # only on `git tag`.
+  build_and_push:
+    executor: go-exec
+    environment:
+      TAG: << pipeline.git.tag >>
+    steps:
+      # Attach the workspace to the current executor.
+      - attach_workspace:
+          at: .
+      # Allows docker commands to be run locally.
+      - setup_remote_docker
+      # Build the docker image and push it to docker hub.
+      - run: docker build -t $DOCKERHUB_USER/<service-name>:$TAG .
+      - run: echo $DOCKERHUB_PASSWORD | docker login -u $DOCKERHUB_USER --password-stdin
+      - run: docker push $DOCKERHUB_USER/<service-name>:$TAG
+
+
+# The workflows describe the jobs and the order in which they need to be run.
+workflows:
+
+  # The dev-pipeline is run when submitting pull requests. Linter checks are run
+  # and the src code is tested with unit and integration tests.
+  dev-pipeline:
+    when:
+      not:
+        equal: [ main, << pipeline.git.branch >> ]
+
+    jobs:
+      # Pull the src code.
+      - pull
+
+      # Fmt, lint and tests should run after the code was pulled.
+      - gofmt:
+          requires:
+            - pull
+      - lint:
+          requires:
+            - pull
+      - unit_tests:
+          requires:
+            - pull
+      - integration_tests:
+          requires:
+            - pull
+
+  # The prod-pipeline is run when PRs are merged into the main branch. To make
+  # sure all components function properly e2e tests are run.
+  prod-pipeline:
+    when:
+      equal: [ main, << pipeline.git.branch >> ]
+
+    jobs:
+      # Pull the src code.
+      - pull
+
+      # Run e2e tests.
+      - e2e_tests:
+          requires:
+            - pull
+
+  # The deploy-pipeline is run when a commit from the main branch is tagged.
+  # A docker image of the service is built and pushed to docker hub.
+  deploy-pipeline:
+    # when:
+    #   and:
+    #     - equal: [ main, << pipeline.git.branch >> ]
+    #     - matches: { pattern: "^v.*", value: << pipeline.git.tag >> }
+
+    jobs:
+      # Pull the src code.
+      - pull:
+          filters: # required since `build_and_push` has filters
+            tags:
+              only: /^v.*/
+            branches:
+              ignore: /.*/
+
+      # Note that we need to provide the `DockerHub` context variables in order
+      # to login to DockerHub.
+      - build_and_push:
+          context: DockerHub
+          requires:
+            - pull
+          filters:
+            # Trigger only on tags.
+            tags:
+              only: /^v.*/
+            # Don't trigger on branches.
+            branches:
+              ignore: /.*/
